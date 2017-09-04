@@ -1,0 +1,96 @@
+Requirements:
+  java 1.8
+  spark 2.2.0
+
+Building and running:
+  The easiest way to build this if needed is to recompile the sources via sbt (http://www.scala-sbt.org/)
+
+  $ sbt package
+
+  this produces a jar in ./target/scala-2.11/dquiz-2.11-1.0.jar
+  which can either be run via spark-submit, imported into spark-shell, or run as a self-contained java app
+
+Running via spark-submit:
+  $ spark-submit --class Questions --master local[*] --driver-memory 4g ./bin/dquiz_2.11-1.0.jar
+
+
+Running in spark-shell:
+  $ spark-shell --driver-memory 4g  --jars ./bin/dquiz_2.11-1.0.jar
+
+Data directory:
+  certain functions expect the data to be stored in a directory from where the containing application is run:
+
+  for example if calling the spark-submit command above, the following command should yield the following result:
+
+  I did not include npidata_20050523-20170507.csv because it would have been too large. You should place download npidata and place it in data/ yourself
+
+  $ ls -1 data/
+  NPPES Deactivated NPI Report 20170509.xlsx
+  deactiviations_20170509.csv
+  npidata_20050523-20170507.csv
+  npidata_20050523-20170507FileHeader.csv
+
+Visualization:
+
+  generating some simple plots via python (3.5)
+
+  $ python scripts/plot_stuff.py daily results/practices_over_time.csv # bonus visualization
+  $ python scripts/plot_stuff.py breakdown results/dist.csv # size distribution for NY, TX, CA, FL
+
+Answers:
+  for convenience, the answers are contained in the following files:
+    answers/dist.csv # the distribution of sizes for FL, TX, NY, CA
+    answers/most_psychologists # the state with the most psychologists (its CA)
+    answers/practices_with_3_physicians # the number of practices with exactly 3 physicians (29030)
+    answers/top_classifications_per_state
+
+Details:
+
+  The following is a high level breakdown of how the following works. I chose to do this in Spark because I thought it would be flexible enough to be able to combine SQL expressions with MapReduce-esque code.
+  All code used to run this is in 
+
+  The core logic to answer the 4 questions are grouped into RegularQuestions
+
+  The entry point that you should follow the main() function in Questions which calls down to Questions.runQuestions
+
+  Getting the state with the most number of psychologists:
+    1. find rows in the npi file that have a Healthcare Provider Taxonomy Code_* column that starts with 103T
+       this is an assumption I made from looking at the codes, probably should have joined instead in case more codes get added,
+       but I'm not going to circle back.
+    2. grouping by state
+    3. counting
+    4. returning the max
+
+  Practices with 3 Physicians:
+    1. find rows in the npi file that have a Healthcare Provider Taxonomy Code_* column that starts with 20, see note in psychologists #1
+    2. grouping by business address fields
+    3. counting
+    4. filtering with count == 3
+
+  Top Physician classification for each state:
+    1. with the physicians dataframe, filter for "Provider Business Practice Location Address Country Code (If outside U.S.)" == null (just using this to identify if in the USA)
+    2. produce a tuple of ((state, classification), 1) for each non null entry in the taxonomy code fields
+    3. group by state and classification
+    4. count/sum the counts
+    5. group by state
+    6. get the max classification by count for the grouped result
+
+  Practice Size distribution:
+    1. using the physician practice counts dataset produced from q2, filter out states outside of NY, TX, CA, FL
+    2. use aggregateByKey to sum up distribution sizes based on the criteria
+
+  Bonus:
+    note: converted xslx to csv, it's included in the data/ folder
+    deactivation data doesn't seem to like being joined with the npi provider on the "NPI" field. only one record matches and it's in NY for 5/9. therefore looks to be irrelevant.
+    as a result, the results produced in this exercise are best guess and are not expected to be accurate. works as follows:
+
+    1. for each record in NPI, only include those of in NY, TX, CA, FL
+    2. map to include a unix timestamp for npi deactivation date, npi reactivation date, provider enumeration date
+    3. deltas for provider enumeration date and reactivation are each a +1, npi deactivation date is a -1
+    4. for state - dates less than the start date (2017-03-01) sum the deltas for enumeration date, reactiveation, deactivation and add them all together -- this is the initial count per state
+    5. for each of (enumeration date, reactivation date, deactivation date) select rows between start and end date 2017-03-01 and 2017-05-01
+          group by the state and date and sum the deltas
+    6. collect results onto driver into a map of (state, date) -> delta
+    7. on the driver, enumerate from start date to end date and increment the total per day if the (state, date) pair is found
+
+    this does not detect if a practice is deactivated/reactivated multiple times
