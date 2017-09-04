@@ -101,14 +101,19 @@ object RegularQuestions {
     * @param physicians DataFrame containing only physicians
     * @return a Dataset over ((statename, classification), count)
     */
-  def statesAndClassifications(physicians: DataFrame)(implicit spark: SparkSession): Dataset[((Option[String], String), Long)] = {
+  def statesAndClassifications(physicians: DataFrame, taxonomy: DataFrame)(implicit spark: SparkSession): Dataset[((Option[String], String), Long)] = {
     import spark.implicits._
+    val codeToClassification = taxonomy.map(row => (row.getAs[String]("Code"), row.getAs[String]("Classification")))
+      .collect().toMap
+
     val stateAndClassSingles = physicians
       .flatMap(row => {
       val state = Option(row.getAs[String]("Provider Business Practice Location Address State Name"))
-      val classifications = TAXONOMY_CODE_FIELDS.view.map(field => Option(row.getAs[String](field)))
+      val codes = TAXONOMY_CODE_FIELDS.view.map(field => Option(row.getAs[String](field)))
         .takeWhile(_.isDefined)
         .flatten
+      val classifications = codes.map(codeToClassification.apply _).toSet //dedupe
+
       classifications.map(c => ((state, c), 1)) // this 1 doesn't really do anything
     })
     stateAndClassSingles.groupByKey(_._1).count()
@@ -120,8 +125,8 @@ object RegularQuestions {
     * @param physicians DataFrame containing only physicians
     * @return an RDD over ((statename, classification), count)
     */
-  def topClassificationsPerState(physicians: DataFrame)(implicit spark: SparkSession): RDD[((Option[String], String), Long)] = {
-    val statesAndClass: RDD[((Option[String], String), Long)] = statesAndClassifications(physicians).rdd
+  def topClassificationsPerState(physicians: DataFrame, taxonomy: DataFrame)(implicit spark: SparkSession): RDD[((Option[String], String), Long)] = {
+    val statesAndClass: RDD[((Option[String], String), Long)] = statesAndClassifications(physicians, taxonomy).rdd
     // could use a window function instead, but they're kind of a PITA to use in spark
     // this forces a shuffle. this is expressible via a aggregateBy, but I'm not going to do it
     val groupedByState = statesAndClass.groupBy(_._1._1)
@@ -134,15 +139,15 @@ object Questions {
   def loadCSV(pathToFile: String)(implicit spark: SparkSession): DataFrame =
     spark.read.format("csv").option("header", "true").load(pathToFile)
 
-  def runQuestions(npiData: DataFrame)(implicit spark: SparkSession) = {
+  def runQuestions(npiData: DataFrame, taxonomy: DataFrame)(implicit spark: SparkSession) = {
     import spark.implicits._
     npiData.persist(StorageLevel.DISK_ONLY)
-
     // get the state with the most # of psychologists
     val stateWithMostPsychologists @ (state, max) = RegularQuestions.mostPsychologists(npiData)
     // cache a dataframe containing only physicians
     val physiciansOnly = RegularQuestions.justPhysicians(npiData).cache()
-    val topClassifications = RegularQuestions.topClassificationsPerState(physiciansOnly).collect()
+
+    val topClassifications = RegularQuestions.topClassificationsPerState(physiciansOnly, taxonomy).collect()
     val physicianPracticeCounts = physiciansOnly.groupByKey(new Address(_))
       .count()
       .persist(StorageLevel.MEMORY_AND_DISK_SER)
@@ -167,10 +172,12 @@ object Questions {
 
     val pathToNPIProviders = "./data/npidata_20050523-20170507.csv"
     val pathToDeactivation = "./data/deactiviations_20170509.csv"
+    val pathToTaxonomy = "./data/nucc_taxonomy_171.csv"
     val npiData = loadCSV(pathToNPIProviders)
     val deactivationData = loadCSV(pathToDeactivation)
-    val (q1, q2, q3, q4, bonus) = runQuestions(npiData)
+    val taxonomyData = loadCSV(pathToTaxonomy)
 
+    val (q1, q2, q3, q4, bonus) = runQuestions(npiData, taxonomyData)
 
     ResultWriters.writeAsLiteral(q1, "most_psychologists")
     ResultWriters.writeAsLiteral(q2, "practices_with_3_physicians")
